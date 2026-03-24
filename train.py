@@ -9,7 +9,9 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import gc
+import json
 import math
+import shutil
 import time
 from dataclasses import dataclass, asdict
 
@@ -23,7 +25,7 @@ cap = torch.cuda.get_device_capability()
 repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
 fa3 = get_kernel(repo).flash_attn_interface
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+from prepare import MAX_SEQ_LEN, TIME_BUDGET, TOKENIZER_DIR, Tokenizer, make_dataloader, evaluate_bpb
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -450,6 +452,9 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
+# Output artifacts
+ARTIFACTS_DIR = os.path.join(os.path.dirname(__file__), "artifacts")
+
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
 # ---------------------------------------------------------------------------
@@ -483,6 +488,7 @@ with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
 model.init_weights()
+model_to_save = model
 
 param_counts = model.num_scaling_params()
 print("Parameter counts:")
@@ -530,6 +536,79 @@ def get_muon_momentum(step):
 
 def get_weight_decay(progress):
     return WEIGHT_DECAY * (1 - progress)
+
+
+def get_hyperparameters():
+    return {
+        "ASPECT_RATIO": ASPECT_RATIO,
+        "HEAD_DIM": HEAD_DIM,
+        "WINDOW_PATTERN": WINDOW_PATTERN,
+        "TOTAL_BATCH_SIZE": TOTAL_BATCH_SIZE,
+        "EMBEDDING_LR": EMBEDDING_LR,
+        "UNEMBEDDING_LR": UNEMBEDDING_LR,
+        "MATRIX_LR": MATRIX_LR,
+        "SCALAR_LR": SCALAR_LR,
+        "WEIGHT_DECAY": WEIGHT_DECAY,
+        "ADAM_BETAS": list(ADAM_BETAS),
+        "WARMUP_RATIO": WARMUP_RATIO,
+        "WARMDOWN_RATIO": WARMDOWN_RATIO,
+        "FINAL_LR_FRAC": FINAL_LR_FRAC,
+        "DEPTH": DEPTH,
+        "DEVICE_BATCH_SIZE": DEVICE_BATCH_SIZE,
+        "MAX_SEQ_LEN": MAX_SEQ_LEN,
+        "TIME_BUDGET": TIME_BUDGET,
+    }
+
+
+def copy_tokenizer_artifacts(dst_dir):
+    os.makedirs(dst_dir, exist_ok=True)
+    for filename in ("tokenizer.pkl", "token_bytes.pt"):
+        src = os.path.join(TOKENIZER_DIR, filename)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(dst_dir, filename))
+
+
+def save_run_artifacts(model, config, metrics, hyperparameters):
+    run_id = time.strftime("%Y%m%d-%H%M%S")
+    run_dir = os.path.join(ARTIFACTS_DIR, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+
+    # Save CPU weights so the artifact can be moved to another machine easily.
+    state_dict_cpu = {
+        name: tensor.detach().cpu()
+        for name, tensor in model.state_dict().items()
+    }
+    checkpoint = {
+        "run_id": run_id,
+        "model_state_dict": state_dict_cpu,
+        "model_config": asdict(config),
+        "hyperparameters": hyperparameters,
+        "metrics": metrics,
+        "tokenizer_dir": "tokenizer",
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    checkpoint_path = os.path.join(run_dir, "model.pt")
+    torch.save(checkpoint, checkpoint_path)
+
+    copy_tokenizer_artifacts(os.path.join(run_dir, "tokenizer"))
+
+    summary_path = os.path.join(run_dir, "summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "run_id": run_id,
+                "checkpoint_path": checkpoint_path,
+                "model_config": asdict(config),
+                "hyperparameters": hyperparameters,
+                "metrics": metrics,
+            },
+            f,
+            indent=2,
+        )
+
+    print(f"Saved run artifacts to: {run_dir}")
+    print(f"  model checkpoint: {checkpoint_path}")
+    return run_dir
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -628,3 +707,21 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+
+final_metrics = {
+    "val_bpb": float(val_bpb),
+    "training_seconds": float(total_training_time),
+    "total_seconds": float(t_end - t_start),
+    "peak_vram_mb": float(peak_vram_mb),
+    "mfu_percent": float(steady_state_mfu),
+    "total_tokens_M": float(total_tokens / 1e6),
+    "num_steps": int(step),
+    "num_params_M": float(num_params / 1e6),
+    "depth": int(DEPTH),
+}
+save_run_artifacts(
+    model=model_to_save,
+    config=config,
+    metrics=final_metrics,
+    hyperparameters=get_hyperparameters(),
+)
